@@ -1,12 +1,24 @@
 import reflex as rx
-from typing import TypedDict, Optional, Any
+from typing import TypedDict, Optional
 import datetime
 import logging
-import wave
-import contextlib
 import random
 from pathlib import Path
 import json
+import os
+import librosa
+import numpy as np
+
+MAX_FILE_SIZE_MB = 100
+MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
+SUPPORTED_MIME_TYPES = {
+    "audio/mpeg": [".mp3"],
+    "audio/wav": [".wav"],
+    "audio/x-wav": [".wav"],
+    "audio/flac": [".flac"],
+    "audio/ogg": [".ogg"],
+}
+WAVEFORM_SAMPLES = 2000
 
 
 class ChordSegment(TypedDict):
@@ -45,6 +57,8 @@ class State(rx.State):
     main_audio_volume: float = 0.8
     chord_track_enabled: bool = True
     chord_track_volume: float = 0.5
+    upload_progress: int = 0
+    upload_message: str = ""
 
     @rx.var
     def active_project(self) -> Optional[Project]:
@@ -83,8 +97,8 @@ class State(rx.State):
     @rx.event
     def create_project(self):
         if not self.new_project_name.strip():
-            return rx.toast("Project name cannot be empty.", duration=3000)
-        new_id = len(self.projects) + 1
+            return rx.toast.error("Project name cannot be empty.", duration=3000)
+        new_id = len(self.projects) + 1 if self.projects else 1
         new_project: Project = {
             "id": new_id,
             "name": self.new_project_name,
@@ -100,97 +114,173 @@ class State(rx.State):
         self.projects.append(new_project)
         self.new_project_name = ""
         self.active_project_id = new_id
-        return rx.toast(f"Project '{new_project['name']}' created!", duration=3000)
+        return rx.toast.success(
+            f"Project '{new_project['name']}' created!", duration=3000
+        )
 
     @rx.event
     def set_active_project(self, project_id: int):
+        self.stop_playback()
         self.active_project_id = project_id
+        if self.active_project and self.active_project["audio_file_name"]:
+            audio_file = self.active_project["audio_file_name"]
+            return rx.call_script(f"loadAudio(rx.get_upload_url('{audio_file}'))")
 
     @rx.event
     def delete_project(self, project_id: int):
+        project_to_delete = next(
+            (p for p in self.projects if p["id"] == project_id), None
+        )
+        if project_to_delete and project_to_delete["audio_file_name"]:
+            self._cleanup_audio_file(project_to_delete["audio_file_name"])
         self.projects = [p for p in self.projects if p["id"] != project_id]
         if self.active_project_id == project_id:
             self.active_project_id = self.projects[0]["id"] if self.projects else None
-        return rx.toast("Project deleted.", duration=3000)
+            if self.active_project_id:
+                return State.set_active_project(self.active_project_id)
+        return rx.toast.info("Project deleted.", duration=3000)
+
+    def _cleanup_audio_file(self, filename: Optional[str]):
+        if not filename:
+            return
+        try:
+            upload_dir = rx.get_upload_dir()
+            file_path = upload_dir / filename
+            if file_path.exists():
+                os.remove(file_path)
+                logging.info(f"Cleaned up old audio file: {filename}")
+        except Exception:
+            logging.exception(f"Error cleaning up file {filename}")
 
     @rx.event
     async def handle_upload(self, files: list[rx.UploadFile]):
         if self.active_project_id is None:
-            yield rx.toast("Please select a project first.", duration=3000)
+            yield rx.toast.warning("Please select a project first.", duration=3000)
+            return
+        if not files:
+            yield rx.toast.error("No file selected for upload.", duration=3000)
             return
         file = files[0]
+        if file.size > MAX_FILE_SIZE_BYTES:
+            yield rx.toast.error(
+                f"File is too large. Maximum size is {MAX_FILE_SIZE_MB}MB.",
+                duration=5000,
+            )
+            return
+        if file.content_type not in SUPPORTED_MIME_TYPES:
+            yield rx.toast.error(
+                f"Unsupported file type: {file.content_type}. Please upload MP3, WAV, FLAC, or OGG.",
+                duration=5000,
+            )
+            return
         self.is_uploading = True
+        self.upload_message = "Uploading file..."
+        self.upload_progress = 0
         yield
+        old_filename = None
         try:
-            upload_data = await file.read()
-            upload_dir = rx.get_upload_dir()
-            upload_dir.mkdir(parents=True, exist_ok=True)
-            unique_name = f"{self.active_project_id}_{file.name}"
-            file_path = upload_dir / unique_name
-            with file_path.open("wb") as f:
-                f.write(upload_data)
-            waveform_data, duration = self._generate_waveform(file_path)
             project_index = -1
             for i, p in enumerate(self.projects):
                 if p["id"] == self.active_project_id:
                     project_index = i
                     break
-            if project_index != -1:
-                self.projects[project_index]["audio_file_name"] = unique_name
-                self.projects[project_index]["waveform_data"] = waveform_data
-                self.projects[project_index]["duration"] = duration
-            yield rx.call_script(f"loadAudio('/upload/{unique_name}')")
-            yield rx.toast("Audio uploaded and processed.", duration=3000)
+            if project_index == -1:
+                raise Exception("Active project not found.")
+            old_filename = self.projects[project_index]["audio_file_name"]
+            self._cleanup_audio_file(old_filename)
+            upload_data = await file.read()
+            upload_dir = rx.get_upload_dir()
+            upload_dir.mkdir(parents=True, exist_ok=True)
+            unique_name = f"{self.active_project_id}_{datetime.datetime.now().timestamp()}_{file.name}"
+            file_path = upload_dir / unique_name
+            with file_path.open("wb") as f:
+                f.write(upload_data)
+            self.upload_message = "Generating waveform..."
+            self.upload_progress = 50
+            yield
+            waveform_data, duration = await self._generate_waveform(file_path)
+            self.upload_message = "Finalizing..."
+            self.upload_progress = 90
+            yield
+            self.projects[project_index].update(
+                {
+                    "audio_file_name": unique_name,
+                    "waveform_data": waveform_data,
+                    "duration": duration,
+                    "tempo": 0.0,
+                    "beats": [],
+                    "key": None,
+                    "chords": [],
+                }
+            )
+            self.upload_progress = 100
+            audio_file_name = self.projects[project_index]["audio_file_name"]
+            yield rx.call_script(f"loadAudio(rx.get_upload_url('{audio_file_name}'))")
+            yield rx.toast.success(
+                "Audio uploaded and processed successfully.", duration=3000
+            )
         except Exception as e:
-            logging.exception(f"Upload failed: {e}")
-            yield rx.toast(f"Upload failed: {e}", duration=5000)
+            logging.exception(f"Upload and processing failed: {e}")
+            yield rx.toast.error(f"Upload failed: {e}", duration=5000)
+            if (
+                "project_index" in locals()
+                and project_index != -1
+                and (old_filename is not None)
+            ):
+                self.projects[project_index]["audio_file_name"] = old_filename
+                self.projects[project_index]["waveform_data"] = []
+                self.projects[project_index]["duration"] = 0.0
         finally:
             self.is_uploading = False
+            self.upload_progress = 0
+            self.upload_message = ""
 
-    def _generate_waveform(self, file_path: Path) -> tuple[list[float], float]:
-        """Generates a low-resolution waveform preview."""
+    async def _generate_waveform(self, file_path: Path) -> tuple[list[float], float]:
+        """Generates a low-resolution waveform preview using librosa."""
         try:
-            with contextlib.closing(wave.open(file_path, "r")) as f:
-                frames = f.getnframes()
-                rate = f.getframerate()
-                duration = frames / float(rate)
-                n_channels = f.getnchannels()
-                sampwidth = f.getsampwidth()
-                audio_data = f.readframes(frames)
-                import numpy as np
-
-                dtype_map = {1: np.int8, 2: np.int16, 4: np.int32}
-                if sampwidth not in dtype_map:
-                    raise ValueError(f"Unsupported sample width: {sampwidth}")
-                data = np.frombuffer(audio_data, dtype=dtype_map[sampwidth])
-                if n_channels > 1:
-                    data = data.reshape(-1, n_channels).mean(axis=1)
-                data = data / np.iinfo(dtype_map[sampwidth]).max
-                num_samples = 2000
-                step = len(data) // num_samples
-                if step == 0:
-                    step = 1
-                peaks = [
-                    float(np.max(data[i : i + step])) for i in range(0, len(data), step)
-                ]
-                return (peaks, duration)
-        except wave.Error as e:
-            logging.exception(f"Could not read as WAV, returning dummy waveform: {e}")
-            return ([random.uniform(0, 0.5) for _ in range(2000)], 180.0)
+            loop = self.get_event_loop()
+            y, sr = await loop.run_in_executor(None, librosa.load, file_path, sr=None)
+            duration = librosa.get_duration(y=y, sr=sr)
+            if y.ndim > 1 or (
+                y.ndim == 1 and y.shape[0] > 0 and isinstance(y[0], np.ndarray)
+            ):
+                y = librosa.to_mono(y)
+            if np.max(np.abs(y)) > 0:
+                y = y / np.max(np.abs(y))
+            num_samples = WAVEFORM_SAMPLES
+            step = len(y) // num_samples if num_samples > 0 else 1
+            if step == 0:
+                step = 1
+            peaks = [
+                float(np.max(np.abs(y[i : i + step]))) for i in range(0, len(y), step)
+            ]
+            return (peaks[:num_samples], duration)
         except Exception as e:
-            logging.exception(f"Waveform generation failed: {e}")
-            return ([], 0.0)
+            logging.exception(f"Waveform generation failed for {file_path}: {e}")
+            try:
+                self._cleanup_audio_file(file_path.name)
+            except Exception as cleanup_error:
+                logging.exception(
+                    f"Failed to cleanup file during waveform error: {cleanup_error}"
+                )
+            raise IOError(
+                f"Failed to process audio. The file may be corrupt or in an unsupported format."
+            )
+
+    @rx.event
+    def trigger_upload(self, upload_id: str):
+        return rx.upload_files(upload_id=upload_id)
 
     @rx.event
     def toggle_play_pause(self):
         self.is_playing = not self.is_playing
-        return rx.call_script("togglePlayPause")
+        return rx.call_script("togglePlayPause()")
 
     @rx.event
     def stop_playback(self):
         self.is_playing = False
         self.current_time = 0.0
-        return rx.call_script("stopPlayback")
+        return rx.call_script("stopPlayback()")
 
     @rx.event
     def set_current_time(self, time: float):
@@ -207,10 +297,15 @@ class State(rx.State):
 
     @rx.event(background=True)
     async def analyze_audio(self):
-        if self.active_project_id is None or not self.active_project:
-            yield rx.toast("No active project to analyze.", duration=3000)
-            return
         async with self:
+            if self.active_project_id is None or not self.active_project:
+                yield rx.toast.error("No active project to analyze.", duration=3000)
+                return
+            if not self.active_project["audio_file_name"]:
+                yield rx.toast.error(
+                    "No audio file found for this project.", duration=3000
+                )
+                return
             self.is_analyzing = True
             project_index = -1
             for i, p in enumerate(self.projects):
@@ -222,7 +317,6 @@ class State(rx.State):
                 self.projects[project_index]["beats"] = []
                 self.projects[project_index]["key"] = None
                 self.projects[project_index]["chords"] = []
-            yield
         try:
             from app.services.analysis import run_full_analysis
 
@@ -231,28 +325,26 @@ class State(rx.State):
             analysis_results = await run_full_analysis(file_path)
             async with self:
                 if project_index != -1:
-                    self.projects[project_index]["tempo"] = analysis_results["tempo"]
-                    self.projects[project_index]["beats"] = analysis_results["beats"]
-                    self.projects[project_index]["key"] = analysis_results["key"]
-                    self.projects[project_index]["chords"] = analysis_results["chords"]
-                yield rx.toast(
+                    self.projects[project_index].update(analysis_results)
+                yield rx.toast.success(
                     f"Analysis complete! Key: {analysis_results['key']}, Tempo: {analysis_results['tempo']:.1f} BPM",
                     duration=5000,
                 )
         except Exception as e:
             logging.exception(f"Analysis failed: {e}")
-            yield rx.toast(f"Analysis failed: {e}", duration=5000)
+            async with self:
+                yield rx.toast.error(f"Analysis failed: {e}", duration=5000)
         finally:
             async with self:
                 self.is_analyzing = False
 
     @rx.event
     def zoom_in(self):
-        self.timeline_zoom = min(self.timeline_zoom * 1.5, 10)
+        self.timeline_zoom = min(self.timeline_zoom * 1.5, 10.0)
 
     @rx.event
     def zoom_out(self):
-        self.timeline_zoom = max(self.timeline_zoom / 1.5, 0.1)
+        self.timeline_zoom = max(self.timeline_zoom / 1.5, 1.0)
 
     @rx.event
     def reset_zoom(self):
@@ -285,14 +377,15 @@ class State(rx.State):
     @rx.event
     def add_keyboard_shortcuts(self):
         return rx.call_script("""
-            document.addEventListener('keydown', (event) => {
-                if (event.code === 'Space') {
+            window.remove_chord_analyzer_listeners?.();
+            const space_handler = (event) => {
+                if (event.code === 'Space' && !(event.target instanceof HTMLInputElement)) {
                     event.preventDefault();
                     window.togglePlayPause();
-                } else if (event.code === 'KeyM') {
-                    event.preventDefault();
-                    const chordTrackEnabled = document.querySelector('input[type=range][class*="accent-emerald-500"]').previousElementSibling.querySelector('i').className.includes('volume-2');
-                    window.toggleChordTrack(!chordTrackEnabled);
                 }
-            });
-            """)
+            };
+            document.addEventListener('keydown', space_handler);
+            window.remove_chord_analyzer_listeners = () => {
+                document.removeEventListener('keydown', space_handler);
+            };
+        """)

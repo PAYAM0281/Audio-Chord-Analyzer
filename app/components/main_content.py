@@ -1,5 +1,5 @@
 import reflex as rx
-from app.states.base import State
+from app.states.base import State, SUPPORTED_MIME_TYPES, MAX_FILE_SIZE_BYTES
 
 
 def transport_controls() -> rx.Component:
@@ -10,8 +10,9 @@ def transport_controls() -> rx.Component:
             class_name=rx.cond(
                 State.is_playing,
                 "hidden",
-                "p-3 bg-emerald-500 text-white rounded-full shadow-lg hover:bg-emerald-600 transition-all",
+                "p-3 bg-emerald-500 text-white rounded-full shadow-lg hover:bg-emerald-600 transition-all disabled:opacity-50",
             ),
+            disabled=~State.has_active_project_audio,
         ),
         rx.el.button(
             rx.icon("pause", size=20),
@@ -25,7 +26,8 @@ def transport_controls() -> rx.Component:
         rx.el.button(
             rx.icon("square", size=20),
             on_click=State.stop_playback,
-            class_name="p-3 bg-gray-600 text-white rounded-full shadow-lg hover:bg-gray-700 transition-all",
+            class_name="p-3 bg-gray-600 text-white rounded-full shadow-lg hover:bg-gray-700 transition-all disabled:opacity-50",
+            disabled=~State.has_active_project_audio,
         ),
         rx.el.div(
             rx.text(
@@ -52,17 +54,19 @@ def volume_controls() -> rx.Component:
                 default_value=State.main_audio_volume.to_string(),
                 on_change=State.set_main_audio_volume.throttle(50),
                 class_name="w-24 accent-emerald-500 cursor-pointer",
+                disabled=~State.has_active_project_audio,
             ),
             class_name="flex items-center gap-2 p-2 bg-white rounded-lg border border-gray-200",
         ),
         rx.el.div(
             rx.el.button(
                 rx.icon(
-                    rx.cond(State.chord_track_enabled, "volume-x", "volume-2"),
+                    rx.cond(State.chord_track_enabled, "volume-2", "volume-x"),
                     size=18,
                     class_name="text-gray-500",
                 ),
                 on_click=State.toggle_chord_track,
+                disabled=~State.chords_detected,
             ),
             rx.el.input(
                 type="range",
@@ -73,6 +77,7 @@ def volume_controls() -> rx.Component:
                 default_value=State.chord_track_volume.to_string(),
                 on_change=State.set_chord_track_volume.throttle(50),
                 class_name="w-24 accent-emerald-500 cursor-pointer",
+                disabled=~State.chords_detected,
             ),
             class_name="flex items-center gap-2 p-2 bg-white rounded-lg border border-gray-200",
         ),
@@ -103,10 +108,10 @@ def waveform_display() -> rx.Component:
                 rx.foreach(
                     State.active_project.waveform_data,
                     lambda peak, index: rx.el.rect(
-                        x=(index * (100 / 2000)).to_string() + "%",
-                        y=((1 - peak) * 50).to_string() + "%",
-                        width=str(100 / 2000 * 0.8),
-                        height=(peak * 100).to_string() + "%",
+                        x=f"{index / 2000 * 100}%",
+                        y=f"{(1 - peak) * 50}%",
+                        width=f"{1 / 2000 * 100 * 0.8}%",
+                        height=f"{peak * 100}%",
                         fill="#34d399",
                     ),
                 ),
@@ -137,7 +142,7 @@ def waveform_display() -> rx.Component:
             rx.el.div(
                 rx.foreach(State.active_project.chords, chord_chip),
                 class_name="absolute top-0 left-0 w-full h-[128px]",
-                style={"pointer-events": "none"},
+                style={"pointer_events": "none"},
             ),
             style={
                 "position": "relative",
@@ -152,10 +157,10 @@ def waveform_display() -> rx.Component:
 
 
 def upload_placeholder() -> rx.Component:
-    return rx.upload.root(
-        rx.el.div(
+    return rx.el.div(
+        rx.upload.root(
             rx.el.div(
-                rx.icon("cloud_upload", size=48, class_name="text-gray-400"),
+                rx.icon("cloud-upload", size=48, class_name="text-gray-400"),
                 rx.el.h3(
                     "Upload Audio File",
                     class_name="mt-4 text-lg font-semibold text-gray-700",
@@ -167,23 +172,34 @@ def upload_placeholder() -> rx.Component:
                 rx.el.p(
                     "(MP3, WAV, FLAC, OGG)", class_name="mt-1 text-xs text-gray-400"
                 ),
-                rx.el.button(
-                    "Select File",
-                    class_name="mt-6 px-4 py-2 bg-emerald-500 text-white rounded-lg font-semibold hover:bg-emerald-600 transition-colors",
-                ),
-                class_name="text-center",
+                class_name="text-center flex flex-col items-center justify-center w-full h-64",
             ),
-            class_name="flex items-center justify-center w-full h-80 border-2 border-dashed border-gray-300 rounded-xl bg-gray-50 hover:bg-gray-100 transition-colors cursor-pointer",
+            class_name="flex items-center justify-center w-full h-full border-2 border-dashed border-gray-300 rounded-xl bg-gray-50 hover:bg-gray-100 transition-colors cursor-pointer",
+            id="audio-upload",
+            on_drop=State.handle_upload(rx.upload_files()),
+            multiple=False,
+            accept=SUPPORTED_MIME_TYPES,
+            max_size=MAX_FILE_SIZE_BYTES,
+            disabled=State.is_uploading | State.active_project_id.is_none(),
         ),
-        id="audio_upload",
-        on_drop=State.handle_upload,
-        accept={
-            "audio/mpeg": [".mp3"],
-            "audio/wav": [".wav"],
-            "audio/flac": [".flac"],
-            "audio/ogg": [".ogg"],
-        },
-        disabled=State.is_uploading | State.active_project_id.is_none(),
+        rx.el.div(
+            rx.foreach(
+                rx.selected_files("audio-upload"),
+                lambda file: rx.el.div(
+                    rx.icon("music-4", size=16),
+                    rx.el.p(file, class_name="text-sm truncate"),
+                    class_name="flex items-center gap-2 p-2 bg-emerald-50 rounded-md border border-emerald-200 text-emerald-800",
+                ),
+            ),
+            class_name="mt-4",
+        ),
+        rx.el.button(
+            "Upload and Process",
+            on_click=State.trigger_upload("audio-upload"),
+            disabled=State.is_uploading,
+            class_name="mt-4 w-full px-4 py-3 bg-emerald-500 text-white font-semibold rounded-lg hover:bg-emerald-600 transition-colors shadow-sm disabled:bg-gray-400",
+        ),
+        class_name="w-full h-96 p-4 flex flex-col items-center justify-center",
     )
 
 
@@ -197,17 +213,40 @@ def chord_chip(chord: dict, index: int) -> rx.Component:
             ),
             style={
                 "position": "absolute",
-                "left": f"{(chord['start_time'] / State.active_project.duration * 100).to_string()}%",
-                "width": f"{((chord['end_time'] - chord['start_time']) / State.active_project.duration * 100).to_string()}%",
+                "left": f"{chord['start_time'] / State.active_project.duration * 100}%",
+                "width": f"{(chord['end_time'] - chord['start_time']) / State.active_project.duration * 100}%",
                 "top": "8px",
-                "min-width": "40px",
-                "z-index": "10",
-                "pointer-events": "auto",
+                "min_width": "40px",
+                "z_index": "10",
+                "pointer_events": "auto",
             },
             class_name="h-[32px] px-2 py-1 bg-emerald-500 rounded-md shadow-sm flex items-center justify-center overflow-hidden hover:bg-emerald-600 hover:shadow-lg hover:scale-105 transition-all duration-150 cursor-pointer border-l-2 border-emerald-300",
             on_click=lambda: State.on_chord_click(index),
         ),
-        f"Confidence: {chord['confidence'] * 100:.1f}% | Notes: {chord['notes'].to_string()}",
+        f"Confidence: {(chord['confidence'] * 100).to_string()}% | Notes: {chord['notes'].to_string()}",
+    )
+
+
+def loading_overlay() -> rx.Component:
+    return rx.el.div(
+        rx.spinner(class_name="text-emerald-500", size="3"),
+        rx.el.p(
+            rx.cond(
+                State.is_uploading,
+                State.upload_message,
+                "Analyzing chords, key, & tempo...",
+            ),
+            class_name="mt-4 text-gray-600 font-medium",
+        ),
+        rx.cond(
+            State.is_uploading,
+            rx.el.progress(
+                value=State.upload_progress,
+                class_name="w-1/2 mt-4 [&::-webkit-progress-bar]:rounded-lg [&::-webkit-progress-value]:rounded-lg [&::-webkit-progress-bar]:bg-slate-300 [&::-webkit-progress-value]:bg-emerald-500 [&::-moz-progress-bar]:bg-emerald-500",
+            ),
+            rx.fragment(),
+        ),
+        class_name="absolute inset-0 flex flex-col items-center justify-center bg-gray-50/80 backdrop-blur-sm z-20 rounded-xl",
     )
 
 
@@ -219,7 +258,7 @@ def main_content() -> rx.Component:
                 (
                     None,
                     rx.el.div(
-                        rx.icon("music", size=48, class_name="text-gray-400"),
+                        rx.icon("folder-search", size=48, class_name="text-gray-400"),
                         rx.el.h2(
                             "No Project Selected",
                             class_name="mt-4 text-2xl font-bold text-gray-700",
@@ -244,20 +283,7 @@ def main_content() -> rx.Component:
                         ),
                         class_name="flex justify-between items-center mb-6",
                     ),
-                    rx.cond(
-                        State.is_uploading | State.is_analyzing,
-                        rx.el.div(
-                            rx.spinner(class_name="text-emerald-500", size="3"),
-                            rx.el.p(
-                                rx.cond(
-                                    State.is_uploading,
-                                    "Processing audio...",
-                                    "Analyzing chords, key, & tempo...",
-                                ),
-                                class_name="mt-4 text-gray-600",
-                            ),
-                            class_name="flex flex-col items-center justify-center h-80 w-full",
-                        ),
+                    rx.el.div(
                         rx.cond(
                             State.has_active_project_audio,
                             rx.el.div(
@@ -292,12 +318,12 @@ def main_content() -> rx.Component:
                                         ),
                                         rx.el.div(
                                             rx.el.button(
-                                                rx.icon("zoom_in"),
+                                                rx.icon("zoom-in"),
                                                 on_click=State.zoom_in,
                                                 class_name="p-2 bg-gray-200 rounded-md hover:bg-gray-300",
                                             ),
                                             rx.el.button(
-                                                rx.icon("zoom_out"),
+                                                rx.icon("zoom-out"),
                                                 on_click=State.zoom_out,
                                                 class_name="p-2 bg-gray-200 rounded-md hover:bg-gray-300",
                                             ),
@@ -322,6 +348,12 @@ def main_content() -> rx.Component:
                             ),
                             upload_placeholder(),
                         ),
+                        rx.cond(
+                            State.is_uploading | State.is_analyzing,
+                            loading_overlay(),
+                            rx.fragment(),
+                        ),
+                        class_name="relative",
                     ),
                     class_name="w-full",
                 ),
