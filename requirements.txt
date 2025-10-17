@@ -1,0 +1,6 @@
+
+reflex==0.8.15a1
+numpy
+librosa
+scipy
+soundfile
